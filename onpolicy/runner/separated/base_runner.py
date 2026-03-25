@@ -1,11 +1,31 @@
 
 import time
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 import os
 import numpy as np
 from itertools import chain
 import torch
-from tensorboardX import SummaryWriter
+try:
+    from tensorboardX import SummaryWriter
+except ImportError:
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError:
+        class SummaryWriter:  # minimal no-op fallback
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def add_scalars(self, *args, **kwargs):
+                pass
+
+            def export_scalars_to_json(self, *args, **kwargs):
+                pass
+
+            def close(self):
+                pass
 
 from onpolicy.utils.separated_buffer import SeparatedReplayBuffer
 from onpolicy.utils.util import update_linear_schedule
@@ -37,6 +57,9 @@ class Runner(object):
         self.use_wandb = self.all_args.use_wandb
         self.use_render = self.all_args.use_render
         self.recurrent_N = self.all_args.recurrent_N
+        self.shared_machine_policy = bool(
+            getattr(self.all_args, "shared_machine_policy", False)
+        )
 
         # interval
         self.save_interval = self.all_args.save_interval
@@ -83,24 +106,48 @@ class Runner(object):
         print("action_space: ", self.envs.action_space)
 
         self.policy = []
-        for agent_id in range(self.num_agents):
-            share_observation_space = self.envs.share_observation_space[agent_id] if self.use_centralized_V else self.envs.observation_space[agent_id]
-            # policy network
-            po = Policy(self.all_args,
-                        self.envs.observation_space[agent_id],
-                        share_observation_space,
-                        self.envs.action_space[agent_id],
-                        device = self.device)
-            self.policy.append(po)
+
+        def _make_policy(agent_id):
+            share_observation_space = (
+                self.envs.share_observation_space[agent_id]
+                if self.use_centralized_V
+                else self.envs.observation_space[agent_id]
+            )
+            return Policy(
+                self.all_args,
+                self.envs.observation_space[agent_id],
+                share_observation_space,
+                self.envs.action_space[agent_id],
+                device=self.device,
+            )
+
+        if self.shared_machine_policy and self.num_agents > 1:
+            manager_policy = _make_policy(0)
+            machine_policy = _make_policy(1)
+            self.policy = [manager_policy] + [machine_policy] * (self.num_agents - 1)
+            print(
+                "Using shared machine policy: agent 0 separate; agents 1..{} share.".format(
+                    self.num_agents - 1
+                )
+            )
+        else:
+            for agent_id in range(self.num_agents):
+                self.policy.append(_make_policy(agent_id))
 
         if self.model_dir is not None:
             self.restore()
 
         self.trainer = []
         self.buffer = []
+        machine_shared_trainer = None
         for agent_id in range(self.num_agents):
             # algorithm
-            tr = TrainAlgo(self.all_args, self.policy[agent_id], device = self.device)
+            if self.shared_machine_policy and agent_id > 1:
+                tr = machine_shared_trainer
+            else:
+                tr = TrainAlgo(self.all_args, self.policy[agent_id], device=self.device)
+                if self.shared_machine_policy and agent_id == 1:
+                    machine_shared_trainer = tr
             # buffer
             share_observation_space = self.envs.share_observation_space[agent_id] if self.use_centralized_V else self.envs.observation_space[agent_id]
             bu = SeparatedReplayBuffer(self.all_args,
@@ -212,9 +259,48 @@ class Runner(object):
                     self.writter.add_scalars(agent_k, {agent_k: v}, total_num_steps)
 
     def log_env(self, env_infos, total_num_steps):
+        mean_infos = {}
         for k, v in env_infos.items():
             if len(v) > 0:
+                mean_val = np.mean(v)
+                mean_infos[k] = mean_val
                 if self.use_wandb:
-                    wandb.log({k: np.mean(v)}, step=total_num_steps)
+                    wandb.log({k: mean_val}, step=total_num_steps)
                 else:
-                    self.writter.add_scalars(k, {k: np.mean(v)}, total_num_steps)
+                    self.writter.add_scalars(k, {k: mean_val}, total_num_steps)
+
+        # Combine inventory/backlog on the same TensorBoard chart (quantities + costs).
+        if not self.use_wandb:
+            if "period_inv_qty" in mean_infos and "period_backlog_qty" in mean_infos:
+                self.writter.add_scalars(
+                    "inv_vs_backlog_qty",
+                    {
+                        "inventory": mean_infos["period_inv_qty"],
+                        "backlog": mean_infos["period_backlog_qty"],
+                    },
+                    total_num_steps,
+                )
+            if "period_inv_cost" in mean_infos and "period_backlog_cost" in mean_infos:
+                self.writter.add_scalars(
+                    "inv_vs_backlog_cost",
+                    {
+                        "inventory_cost": mean_infos["period_inv_cost"],
+                        "backlog_cost": mean_infos["period_backlog_cost"],
+                    },
+                    total_num_steps,
+                )
+
+            # Per-product inventory/backlog on the same graph
+            inv_keys = {k: v for k, v in mean_infos.items() if k.startswith("inventory_prod_")}
+            for inv_key, inv_val in inv_keys.items():
+                suffix = inv_key.replace("inventory_", "")
+                backlog_key = f"backlog_{suffix}"
+                if backlog_key in mean_infos:
+                    self.writter.add_scalars(
+                        f"inv_vs_backlog_{suffix}",
+                        {
+                            "inventory": inv_val,
+                            "backlog": mean_infos[backlog_key],
+                        },
+                        total_num_steps,
+                    )

@@ -1,9 +1,13 @@
 import numpy as np
 
-import gym
-from gym import spaces
+try:
+    import gymnasium as gym
+    from gymnasium import spaces
+except ImportError:
+    import gym
+    from gym import spaces
 
-from onpolicy.envs.mpe.multi_discrete import MultiDiscrete
+from onpolicy.utils.multi_discrete import MultiDiscrete
 
 
 class BoschEnv(object):
@@ -31,26 +35,48 @@ class BoschEnv(object):
         )
 
         # Capacity and demand parameters
-        self.capacity_per_line = float(getattr(args, "capacity_per_line", 100.0))
-        self.max_lot_size = int(getattr(args, "max_lot_size", 10))
+        self.capacity_per_line = self._get_array_arg(
+            args, "capacity_per_line", self.num_lines, default=100.0
+        )
+        # Manager horizon (days of demand to cover per line)
+        self.manager_max_horizon = int(
+            getattr(args, "manager_max_horizon", 7)
+        )
 
         # Cost parameters
         self.holding_cost = float(getattr(args, "holding_cost", 1.0))
         self.backlog_cost = float(getattr(args, "backlog_cost", 10.0))
         self.production_cost = float(getattr(args, "production_cost", 1.0))
         self.setup_cost = float(getattr(args, "setup_cost", 2.0))
-        self.pm_cost = float(getattr(args, "pm_cost", 20.0))
-        self.cm_cost = float(getattr(args, "cm_cost", 40.0))
+        self.pm_cost = self._get_array_arg(
+            args, "pm_cost", self.num_lines, default=20.0
+        )
+        self.cm_cost = self._get_array_arg(
+            args, "cm_cost", self.num_lines, default=40.0
+        )
         self.alpha_cost_weight = float(getattr(args, "alpha_cost_weight", 0.1))
 
-        # Simple exponential hazard-rate style degradation
-        self.hazard_rate = float(getattr(args, "hazard_rate", 1e-3))
+        # Per-line hazard-rate style degradation (scalar or list)
+        self.hazard_rate = self._get_array_arg(
+            args, "hazard_rate", self.num_lines, default=1e-3
+        )
 
         # Time-related parameters (capacity is in "hours" or generic time units)
-        self.pm_time = float(getattr(args, "pm_time", 0.0))
-        self.cm_time = float(getattr(args, "cm_time", 0.0))
+        self.pm_time = self._get_array_arg(
+            args, "pm_time", self.num_lines, default=0.0
+        )
+        self.cm_time = self._get_array_arg(
+            args, "cm_time", self.num_lines, default=0.0
+        )
 
-        # Per-product processing times and mean demand (can be scalars or comma-separated lists)
+        # Reward shaping options for machine agents
+        self.dense_production_reward = float(
+            getattr(args, "dense_production_reward", 1.0)
+        )
+        self.dense_setup_penalty = float(getattr(args, "dense_setup_penalty", 1.0))
+        self.dense_pm_penalty = float(getattr(args, "dense_pm_penalty", 1.0))
+
+        # Per-product processing times and mean demand (kept for compatibility)
         self.processing_time = self._get_array_arg(
             args, "processing_time", self.num_products, default=1.0
         )
@@ -58,19 +84,38 @@ class BoschEnv(object):
             args, "mean_demand", self.num_products, default=10.0
         )
 
+        # Per-line processing time matrix (lines x products). Falls back to per-product values.
+        if getattr(args, "processing_time_matrix", None) is not None:
+            self.processing_time_matrix = self._get_matrix_arg(
+                args,
+                "processing_time_matrix",
+                (self.num_lines, self.num_products),
+                default=1.0,
+            )
+        else:
+            self.processing_time_matrix = np.tile(
+                self.processing_time[None, :], (self.num_lines, 1)
+            ).astype(np.float32)
+
         # Sequence-dependent setup cost/time matrices and heterogeneous production costs
         base_setup_cost = float(getattr(args, "setup_cost", 2.0))
         base_setup_time = float(getattr(args, "setup_time", 0.0))
-        self.setup_cost_matrix = self._get_matrix_arg(
+        self.first_setup_cost = self._get_array_arg(
+            args, "first_setup_cost", self.num_lines, default=base_setup_cost
+        )
+        self.first_setup_time = self._get_array_arg(
+            args, "first_setup_time", self.num_lines, default=base_setup_time
+        )
+        self.setup_cost_matrix = self._get_tensor_arg(
             args,
             "setup_cost_matrix",
-            (self.num_products, self.num_products),
+            (self.num_lines, self.num_products, self.num_products),
             default=base_setup_cost,
         )
-        self.setup_time_matrix = self._get_matrix_arg(
+        self.setup_time_matrix = self._get_tensor_arg(
             args,
             "setup_time_matrix",
-            (self.num_products, self.num_products),
+            (self.num_lines, self.num_products, self.num_products),
             default=base_setup_time,
         )
 
@@ -91,6 +136,15 @@ class BoschEnv(object):
         )
         self.line_eligibility = (self.line_eligibility > 0.5).astype(np.float32)
 
+        demand_profile_raw = getattr(args, "demand_profile", None)
+        if demand_profile_raw is not None:
+            self.demand_profile = self._get_matrix_arg(
+                args,
+                "demand_profile",
+                (self.num_periods, self.num_products),
+                default=0.0,
+            )
+
         # Time / episode tracking (micro-steps within periods)
         self.current_step = 0
         self.period_index = 0
@@ -104,15 +158,25 @@ class BoschEnv(object):
         # Observation layout (same length for all agents)
         # [inventory (P),
         #  backlog (P),
-        #  remaining_demand (P),
+        #  queue (L*P) [manager sees all line queues;
+        #              machines see own line queue in its segment],
+        #  coverage (P) [manager sees per-product line coverage; machines see zeros],
+        #  queue_total_per_product (P) [manager only; machines see zeros],
+        #  shortfall_per_product (P) [manager only; machines see zeros],
+        #  demand_window (lookahead_days * P),
         #  remaining_periods (1),
         #  line_availability (L),
         #  line_setup (L one-hot over products, flattened),
         #  ages (L),
-        #  local_line_id_one_hot (L),
-        #  padding ...]
+        #  local_line_id_one_hot (L)]
+        self.lookahead_days = int(getattr(args, "lookahead_days", 5))
         self.obs_dim = (
-            3 * self.num_products
+            2 * self.num_products
+            + self.num_lines * self.num_products
+            + self.num_products
+            + self.num_products
+            + self.num_products
+            + self.lookahead_days * self.num_products
             + 1
             + self.num_lines
             + self.num_lines * self.num_products
@@ -136,9 +200,12 @@ class BoschEnv(object):
         ]
 
         # Action spaces
-        # Agent 0: MultiDiscrete over lot sizes per (line, product)
-        # Each dim k in [0, max_lot_size]
-        lot_dims = [[0, self.max_lot_size]] * (self.num_lines * self.num_products)
+        # Agent 0: MultiDiscrete per line: (product_index, horizon_days)
+        # product_index in [0, num_products-1], horizon_days in [0, manager_max_horizon]
+        lot_dims = []
+        for _ in range(self.num_lines):
+            lot_dims.append([0, self.num_products - 1])
+            lot_dims.append([0, self.manager_max_horizon])
         agent0_act = MultiDiscrete(lot_dims)
 
         # Machine agents: Discrete
@@ -204,6 +271,38 @@ class BoschEnv(object):
             )
         return arr.reshape(rows, cols)
 
+    def _get_tensor_arg(self, args, name, shape, default):
+        """
+        Helper to read scalar or comma-separated list arguments into
+        a float tensor with given shape.
+        For setup matrices, also accepts a single product×product matrix
+        and tiles it across lines.
+        """
+        raw = getattr(args, name, None)
+        total = int(np.prod(shape))
+        if raw is None:
+            return np.ones(shape, dtype=np.float32) * float(default)
+
+        if isinstance(raw, (list, np.ndarray)):
+            arr = np.asarray(raw, dtype=np.float32)
+        else:
+            parts = str(raw).split(",")
+            arr = np.array([float(p) for p in parts], dtype=np.float32)
+
+        if arr.size == 1:
+            arr = np.repeat(arr, total)
+
+        per_line = int(np.prod(shape[1:]))
+        if arr.size == per_line and shape[0] > 1:
+            arr = np.tile(arr, shape[0])
+
+        if arr.size != total:
+            raise ValueError(
+                f"Argument {name} expects {total} values (or {per_line} to "
+                f"tile across lines), got {arr.size}."
+            )
+        return arr.reshape(shape)
+
     # ------------------------------------------------------------------
     # Gym-like API
     # ------------------------------------------------------------------
@@ -226,15 +325,19 @@ class BoschEnv(object):
 
         :param actions_env: list of per-agent one-hot / multi-one-hot actions.
         """
-        rewards = np.zeros(self.num_agents, dtype=np.float32)
+        rewards = np.zeros((self.num_agents, 1), dtype=np.float32)
         done = False
 
-        manager_phase = self.step_in_period == 0
+        is_manager_step = self.step_in_period == 0
 
-        if manager_phase:
+        if is_manager_step:
             self._manager_step(actions_env)
         else:
-            self._machines_step(actions_env)
+            self._machines_step(actions_env, rewards)
+
+        # Track average queue size per line across micro-steps in this period
+        self.period_queue_sum += np.sum(self.queue, axis=1)
+        self.period_queue_steps += 1
 
         # Advance micro-step counters
         self.step_in_period += 1
@@ -242,7 +345,7 @@ class BoschEnv(object):
 
         # Decide whether to end this period
         end_of_period = (
-            self.step_in_period >= self.max_actions_per_period
+            self.step_in_period > self.max_actions_per_period
             or self._period_effectively_over()
         )
 
@@ -259,7 +362,35 @@ class BoschEnv(object):
 
         obs = self._build_observations()
         dones = [done for _ in range(self.num_agents)]
-        infos = [{} for _ in range(self.num_agents)]
+        next_available_actions = self._build_available_actions()
+        infos = []
+        for agent_id in range(self.num_agents):
+            info = {"available_actions": next_available_actions[agent_id].copy()}
+            if agent_id == 0:
+                # This flag is for next-step policy loss masking in the runner.
+                info["manager_active"] = 1.0 if is_manager_step else 0.0
+                if end_of_period:
+                    info["period_inv_cost"] = float(self.last_inv_cost)
+                    info["period_backlog_cost"] = float(self.last_backlog_cost)
+                    info["period_inv_qty"] = float(self.last_inv_qty)
+                    info["period_backlog_qty"] = float(self.last_backlog_qty)
+                    info["period_manager_horizons"] = (
+                        self.last_manager_horizons.copy()
+                    )
+                    info["period_manager_horizon_mean"] = float(
+                        np.mean(self.last_manager_horizons)
+                    )
+                    info["period_queue_avg_per_line"] = self.last_queue_avg_per_line.copy()
+                    info["period_backlog_per_product"] = self.last_backlog_per_product.copy()
+                    info["period_inventory_per_product"] = self.last_inventory_per_product.copy()
+                    info["period_prod_cost"] = float(self.last_prod_cost)
+                    info["period_prod_cost_per_line"] = self.last_prod_cost_per_line.copy()
+                    info["period_setup_cost"] = float(self.last_setup_cost)
+                    info["period_pm_cost"] = float(self.last_pm_cost)
+                    info["period_cm_cost"] = float(self.last_cm_cost)
+                    info["period_utilization"] = float(self.last_utilization_total)
+                    info["period_utilization_per_line"] = self.last_utilization_per_line.copy()
+            infos.append(info)
 
         return obs, rewards, dones, infos
 
@@ -271,6 +402,10 @@ class BoschEnv(object):
         Simple deterministic demand: constant per product per period.
         Can be replaced with real Bosch parameters or samples.
         """
+        if hasattr(self, "demand_profile"):
+            self.demand = self.demand_profile.astype(np.float32).copy()
+            return
+
         base_demand = self.mean_demand.astype(np.float32)
         self.demand = np.tile(base_demand[None, :], (self.num_periods, 1))
 
@@ -306,6 +441,25 @@ class BoschEnv(object):
         self.period_setup_costs = np.zeros(self.num_lines, dtype=np.float32)
         self.period_pm_costs = np.zeros(self.num_lines, dtype=np.float32)
         self.period_cm_costs = np.zeros(self.num_lines, dtype=np.float32)
+        self.period_queue_sum = np.zeros(self.num_lines, dtype=np.float32)
+        self.period_queue_steps = 0
+
+        # Last-period stats for logging
+        self.last_inv_cost = 0.0
+        self.last_backlog_cost = 0.0
+        self.last_inv_qty = 0.0
+        self.last_backlog_qty = 0.0
+        self.last_manager_horizons = np.zeros(self.num_lines, dtype=np.float32)
+        self.last_queue_avg_per_line = np.zeros(self.num_lines, dtype=np.float32)
+        self.last_backlog_per_product = np.zeros(self.num_products, dtype=np.float32)
+        self.last_inventory_per_product = np.zeros(self.num_products, dtype=np.float32)
+        self.last_prod_cost = 0.0
+        self.last_prod_cost_per_line = np.zeros(self.num_lines, dtype=np.float32)
+        self.last_setup_cost = 0.0
+        self.last_pm_cost = 0.0
+        self.last_cm_cost = 0.0
+        self.last_utilization_total = 0.0
+        self.last_utilization_per_line = np.zeros(self.num_lines, dtype=np.float32)
 
     def _start_new_period(self):
         # Reset per-period capacity, flags, and aggregates, but keep
@@ -317,21 +471,102 @@ class BoschEnv(object):
         self.period_setup_costs.fill(0.0)
         self.period_pm_costs.fill(0.0)
         self.period_cm_costs.fill(0.0)
+        self.period_queue_sum.fill(0.0)
+        self.period_queue_steps = 0
 
     def _manager_step(self, actions_env):
         """
         Agent 0 chooses lot allocations once per period.
         """
-        # Decode agent 0 action (lot sizes MultiDiscrete as concatenated one-hot)
-        lot_matrix = self._decode_agent0_action(actions_env[0])
+        # Decode agent 0 action (product + horizon per line)
+        products, horizons = self._decode_agent0_action(actions_env[0])
+        self.last_manager_horizons = horizons.astype(np.float32).copy()
 
-        # Enforce product-line eligibility: ineligible lots are discarded.
-        lot_matrix = lot_matrix * self.line_eligibility
+        # Add allocated lots into each line's queue based on demand horizon.
+        # Backlog is shared across lines choosing the same product and
+        # is split proportionally by each line's horizon demand.
+        lines_by_product = {p: [] for p in range(self.num_products)}
+        demand_by_line = np.zeros(self.num_lines, dtype=np.float32)
+        total_demand_by_product = np.zeros(self.num_products, dtype=np.float32)
+        for line_idx in range(self.num_lines):
+            prod_idx = int(products[line_idx])
+            horizon = int(horizons[line_idx])
+            if horizon <= 0:
+                continue
+            if self.line_eligibility[line_idx, prod_idx] < 0.5:
+                continue
+            start = self.period_index
+            end = min(self.period_index + horizon, self.num_periods)
+            demand_sum = float(np.sum(self.demand[start:end, prod_idx]))
+            if demand_sum <= 0.0 and self.backlog[prod_idx] <= 0.0:
+                continue
+            lines_by_product[prod_idx].append(line_idx)
+            demand_by_line[line_idx] = demand_sum
+            total_demand_by_product[prod_idx] += demand_sum
 
-        # Add allocated lots into each line's queue.
-        self.queue += lot_matrix
+        for line_idx in range(self.num_lines):
+            prod_idx = int(products[line_idx])
+            horizon = int(horizons[line_idx])
 
-    def _machines_step(self, actions_env):
+            if horizon <= 0:
+                continue
+
+            if self.line_eligibility[line_idx, prod_idx] < 0.5:
+                continue
+
+            start = self.period_index
+            end = min(self.period_index + horizon, self.num_periods)
+            demand_sum = float(np.sum(self.demand[start:end, prod_idx]))
+            if demand_sum <= 0.0 and self.backlog[prod_idx] <= 0.0:
+                continue
+
+            assigned_lines = lines_by_product[prod_idx]
+            if not assigned_lines:
+                continue
+
+            if total_demand_by_product[prod_idx] > 0.0:
+                share_ratio = float(
+                    demand_by_line[line_idx] / total_demand_by_product[prod_idx]
+                )
+            else:
+                share_ratio = 1.0 / float(len(assigned_lines))
+
+            backlog_share = float(self.backlog[prod_idx]) * share_ratio
+            inventory_share = float(self.inventory[prod_idx]) * share_ratio
+
+            target_total_needed = demand_sum + backlog_share
+
+            # Already in progress for this line/product
+            already_in_progress = float(self.queue[line_idx, prod_idx])
+
+            # Net new units to add
+            net_new_qty = max(
+                0.0, target_total_needed - inventory_share - already_in_progress
+            )
+
+            # Cap by line capacity over the selected horizon (net of setup time).
+            setup_time_for_line = 0.0
+            last_prod = int(self.line_setup[line_idx])
+            if last_prod < 0:
+                setup_time_for_line = float(self.first_setup_time[line_idx])
+            elif last_prod != prod_idx:
+                setup_time_for_line = float(
+                    self.setup_time_matrix[line_idx, last_prod, prod_idx]
+                )
+
+            cap_hours = float(self.capacity_per_line[line_idx]) * float(horizon)
+            proc_time = float(self.processing_time_matrix[line_idx, prod_idx])
+            cap_hours = max(0.0, cap_hours - setup_time_for_line)
+            cap_units = cap_hours / proc_time if proc_time > 0.0 else 0.0
+
+            qty_to_add = min(net_new_qty, cap_units)
+
+            if qty_to_add <= 0.0:
+                continue
+
+            self.queue[line_idx, prod_idx] += qty_to_add
+
+    def _machines_step(self, actions_env, rewards):
         """
         Machine agents act given current queues and remaining capacity.
         """
@@ -353,61 +588,71 @@ class BoschEnv(object):
 
             # Preventive maintenance
             if act_idx == pm_index:
-                if self.pm_time > 0.0 and self.remaining_capacity[line_idx] > 0.0:
-                    used = min(self.pm_time, self.remaining_capacity[line_idx])
+                pm_cost = (
+                    float(self.pm_cost[line_idx])
+                    if np.ndim(self.pm_cost) > 0
+                    else float(self.pm_cost)
+                )
+                pm_time = (
+                    float(self.pm_time[line_idx])
+                    if np.ndim(self.pm_time) > 0
+                    else float(self.pm_time)
+                )
+                if pm_time > 0.0 and self.remaining_capacity[line_idx] > 0.0:
+                    used = min(pm_time, self.remaining_capacity[line_idx])
                     self.remaining_capacity[line_idx] -= used
-                self.period_pm_costs[line_idx] += self.pm_cost
+                self.period_pm_costs[line_idx] += pm_cost
                 self.ages[line_idx] = 0.0
+                rewards[agent_id, 0] -= self.dense_pm_penalty * pm_cost
                 # PM does not automatically end the shift; further actions may follow.
                 continue
 
             # Produce a product
             if act_idx < 0 or act_idx >= self.num_products:
-                # Invalid index; treat as end of shift.
-                self.line_done[line_idx] = True
+                # Out-of-range action is ignored; masking should prevent this.
                 continue
 
             # Check eligibility
             if self.line_eligibility[line_idx, act_idx] < 0.5:
-                # Ineligible product on this line; end shift to discourage this choice.
-                self.line_done[line_idx] = True
+                # Ineligible action is ignored; masking should prevent this.
                 continue
 
             # How much is waiting in this line's queue for this product?
             requested_qty = float(self.queue[line_idx, act_idx])
             if requested_qty <= 0.0:
-                # Nothing left to process; end shift for this line.
-                self.line_done[line_idx] = True
+                # Empty queue choice is ignored; masking should prevent this.
                 continue
 
             last_prod = int(self.line_setup[line_idx])
             setup_time = 0.0
             setup_cost = 0.0
-            if last_prod >= 0 and last_prod != act_idx:
-                setup_time = float(self.setup_time_matrix[last_prod, act_idx])
-                setup_cost = float(self.setup_cost_matrix[last_prod, act_idx])
+            if last_prod < 0:
+                setup_time = float(self.first_setup_time[line_idx])
+                setup_cost = float(self.first_setup_cost[line_idx])
+            elif last_prod != act_idx:
+                setup_time = float(self.setup_time_matrix[line_idx, last_prod, act_idx])
+                setup_cost = float(self.setup_cost_matrix[line_idx, last_prod, act_idx])
 
-            proc_time_per_unit = float(self.processing_time[act_idx])
+            proc_time_per_unit = float(
+                self.processing_time_matrix[line_idx, act_idx]
+            )
             if proc_time_per_unit <= 0.0:
-                # Cannot process this product.
-                self.line_done[line_idx] = True
+                # Invalid processing time choice is ignored; masking should prevent this.
                 continue
 
             available_for_proc = self.remaining_capacity[line_idx] - setup_time
             if available_for_proc <= 0.0:
-                # Not enough time even to pay setup; end shift.
-                self.line_done[line_idx] = True
+                # Not enough time for selected product; action is ignored.
                 continue
 
             max_qty_cap = int(available_for_proc // proc_time_per_unit)
             if max_qty_cap <= 0:
-                # Not enough capacity to process a single unit.
-                self.line_done[line_idx] = True
+                # Not enough capacity for selected product; action is ignored.
                 continue
 
             qty = min(int(requested_qty), max_qty_cap)
             if qty <= 0:
-                self.line_done[line_idx] = True
+                # Degenerate selected quantity; action is ignored.
                 continue
 
             # Time consumed this micro-step on this line
@@ -423,17 +668,105 @@ class BoschEnv(object):
             self.period_produced_per_line[line_idx, act_idx] += qty
             self.period_produced_per_product[act_idx] += qty
 
-            # Sequence-dependent setup cost if there was a switch
-            if setup_time > 0.0 or setup_cost > 0.0:
+            # Sequence-dependent setup cost if there was a changeover
+            if setup_cost > 0.0 or setup_time > 0.0:
                 self.period_setup_costs[line_idx] += setup_cost
-                self.line_setup[line_idx] = act_idx
+                rewards[agent_id, 0] -= (
+                    self.dense_setup_penalty * float(setup_cost)
+                )
+
+            rewards[agent_id, 0] += self.dense_production_reward * float(qty)
+
+            # Always record the last produced product (needed for next changeover calc)
+            self.line_setup[line_idx] = act_idx
 
             # Age increases with actual runtime (excluding setup)
-            self.ages[line_idx] += qty * proc_time_per_unit
+            delta_age = qty * proc_time_per_unit
+            self.ages[line_idx] += delta_age
+
+            # Deterministic expected CM impact based on incremental wear
+            expected_failures = float(self.hazard_rate[line_idx]) * delta_age
+            step_cm_cost = expected_failures * float(self.cm_cost[line_idx])
+            self.period_cm_costs[line_idx] += step_cm_cost
+            rewards[agent_id, 0] -= step_cm_cost
+
+            cm_time = (
+                float(self.cm_time[line_idx])
+                if np.ndim(self.cm_time) > 0
+                else float(self.cm_time)
+            )
+            step_cm_time = expected_failures * cm_time
+            if step_cm_time > 0.0:
+                self.remaining_capacity[line_idx] = max(
+                    0.0, self.remaining_capacity[line_idx] - step_cm_time
+                )
 
             # If no capacity remains, end shift for this line.
             if self.remaining_capacity[line_idx] <= 0.0:
                 self.line_done[line_idx] = True
+
+    def _can_process_product(self, line_idx, product_idx):
+        if self.line_eligibility[line_idx, product_idx] < 0.5:
+            return False
+
+        requested_qty = float(self.queue[line_idx, product_idx])
+        if requested_qty <= 0.0:
+            return False
+
+        proc_time_per_unit = float(
+            self.processing_time_matrix[line_idx, product_idx]
+        )
+        if proc_time_per_unit <= 0.0:
+            return False
+
+        last_prod = int(self.line_setup[line_idx])
+        setup_time = 0.0
+        if last_prod < 0:
+            setup_time = float(self.first_setup_time[line_idx])
+        elif last_prod != product_idx:
+            setup_time = float(self.setup_time_matrix[line_idx, last_prod, product_idx])
+
+        available_for_proc = self.remaining_capacity[line_idx] - setup_time
+        if available_for_proc <= 0.0:
+            return False
+
+        max_qty_cap = int(available_for_proc // proc_time_per_unit)
+        if max_qty_cap <= 0:
+            return False
+
+        return True
+
+    def _line_available_actions(self, line_idx):
+        pm_index = self.num_products
+        end_index = self.num_products + 1
+        mask = np.zeros(self.num_products + 2, dtype=np.float32)
+
+        # Machine actions are ignored in manager phase; keep a single valid action.
+        if self.step_in_period == 0:
+            mask[end_index] = 1.0
+            return mask
+
+        # Line already ended; only explicit end-shift is valid.
+        if self.line_done[line_idx]:
+            mask[end_index] = 1.0
+            return mask
+
+        # PM and end shift are always valid controls for active lines.
+        mask[pm_index] = 1.0
+        mask[end_index] = 1.0
+
+        for product_idx in range(self.num_products):
+            if self._can_process_product(line_idx, product_idx):
+                mask[product_idx] = 1.0
+
+        return mask
+
+    def _build_available_actions(self):
+        # Agent 0 uses MultiDiscrete and does not consume available_actions.
+        available_actions = [np.zeros(0, dtype=np.float32)]
+        for line_idx in range(self.num_lines):
+            available_actions.append(self._line_available_actions(line_idx))
+        return available_actions
 
     def _period_effectively_over(self):
         """
@@ -459,46 +792,74 @@ class BoschEnv(object):
         inv_cost, backlog_cost = self._update_inventory_and_backlog(
             self.period_produced_per_product
         )
+        self.last_inv_cost = float(inv_cost)
+        self.last_backlog_cost = float(backlog_cost)
+        self.last_inv_qty = float(np.sum(self.inventory))
+        self.last_backlog_qty = float(np.sum(self.backlog))
+        self.last_backlog_per_product = self.backlog.astype(np.float32).copy()
+        self.last_inventory_per_product = self.inventory.astype(np.float32).copy()
+
+        if self.period_queue_steps > 0:
+            self.last_queue_avg_per_line = (
+                self.period_queue_sum / float(self.period_queue_steps)
+            ).astype(np.float32)
+        else:
+            self.last_queue_avg_per_line = np.zeros(
+                self.num_lines, dtype=np.float32
+            )
 
         # Setup and PM costs are already accumulated per line.
         setup_cost_total = float(np.sum(self.period_setup_costs))
         pm_cost_total = float(np.sum(self.period_pm_costs))
 
-        # Expected CM cost from current ages
-        expected_failures = self.hazard_rate * self.ages
-        self.period_cm_costs = expected_failures * self.cm_cost
+        # Expected CM cost accumulated deterministically during the period
         expected_cm_cost_total = float(np.sum(self.period_cm_costs))
 
         # Heterogeneous production cost per line and product
         prod_cost_total = float(
             np.sum(self.period_produced_per_line * self.production_cost_matrix)
         )
+        prod_cost_per_line = np.sum(
+            self.period_produced_per_line * self.production_cost_matrix, axis=1
+        ).astype(np.float32)
 
-        total_period_cost = (
-            inv_cost
-            + backlog_cost
-            + setup_cost_total
-            + pm_cost_total
-            + expected_cm_cost_total
-            + prod_cost_total
+        # Capacity utilization (runtime / capacity)
+        runtime_per_line = np.sum(
+            self.period_produced_per_line * self.processing_time_matrix, axis=1
+        )
+        cap = self.capacity_per_line.astype(np.float32)
+        util_per_line = np.zeros(self.num_lines, dtype=np.float32)
+        for i in range(self.num_lines):
+            if cap[i] > 0.0:
+                util_per_line[i] = float(runtime_per_line[i] / cap[i])
+        util_total = float(
+            np.sum(runtime_per_line) / max(1e-6, float(np.sum(cap)))
         )
 
-        rewards = np.zeros(self.num_agents, dtype=np.float32)
+        # Store per-period cost breakdowns for logging
+        self.last_prod_cost = prod_cost_total
+        self.last_prod_cost_per_line = prod_cost_per_line
+        self.last_setup_cost = setup_cost_total
+        self.last_pm_cost = pm_cost_total
+        self.last_cm_cost = expected_cm_cost_total
+        self.last_utilization_per_line = util_per_line
+        self.last_utilization_total = util_total
 
-        # Agent 0: lot-sizing & allocation
-        rewards[0] = -float(inv_cost + backlog_cost) + self.alpha_cost_weight * (
-            -float(total_period_cost)
+        # --- 1. DIRECT COSTS ---
+        manager_direct_costs = inv_cost + backlog_cost + prod_cost_total
+        worker_total_direct_costs = setup_cost_total + pm_cost_total + expected_cm_cost_total
+
+        rewards = np.zeros((self.num_agents, 1), dtype=np.float32)
+
+        # --- 2. MANAGER REWARD ---
+        rewards[0, 0] = -float(manager_direct_costs) + self.alpha_cost_weight * (
+            -float(worker_total_direct_costs)
         )
 
-        # Machine agents: per line local costs + shared global term
+        # --- 3. MACHINE REWARD ---
         for line_idx in range(self.num_lines):
-            local_cost = (
-                self.period_setup_costs[line_idx]
-                + self.period_pm_costs[line_idx]
-                + self.period_cm_costs[line_idx]
-            )
-            rewards[1 + line_idx] = -float(local_cost) + self.alpha_cost_weight * (
-                -float(total_period_cost)
+            rewards[1 + line_idx, 0] = self.alpha_cost_weight * (
+                -float(manager_direct_costs)
             )
 
         return rewards
@@ -529,32 +890,40 @@ class BoschEnv(object):
 
     def _decode_agent0_action(self, action_vec):
         """
-        Convert concatenated one-hot representation back into a
-        [num_lines, num_products] lot-size matrix.
+        Convert concatenated one-hot representation back into per-line
+        (product_index, horizon_days) selections.
         """
         one_hot = np.asarray(action_vec, dtype=np.float32).ravel()
 
-        num_dims = self.num_lines * self.num_products
-        block_size = self.max_lot_size + 1  # values 0..max_lot_size
+        num_dims = self.num_lines * 2
+        block_sizes = [self.num_products, self.manager_max_horizon + 1]
 
-        expected_len = num_dims * block_size
+        expected_len = 0
+        for _ in range(self.num_lines):
+            expected_len += block_sizes[0] + block_sizes[1]
+
         if one_hot.size != expected_len:
             raise ValueError(
                 f"Agent 0 action length {one_hot.size} does not match "
                 f"expected {expected_len} for "
-                f"{num_dims} dims and block_size {block_size}."
+                f"{num_dims} dims."
             )
 
-        lots = np.zeros(num_dims, dtype=np.float32)
-        offset = 0
-        for d in range(num_dims):
-            segment = one_hot[offset : offset + block_size]
-            idx = int(np.argmax(segment))
-            lots[d] = float(idx)
-            offset += block_size
+        products = np.zeros(self.num_lines, dtype=np.float32)
+        horizons = np.zeros(self.num_lines, dtype=np.float32)
 
-        lot_matrix = lots.reshape(self.num_lines, self.num_products)
-        return lot_matrix
+        offset = 0
+        for line_idx in range(self.num_lines):
+            # product index
+            seg = one_hot[offset : offset + block_sizes[0]]
+            products[line_idx] = float(int(np.argmax(seg)))
+            offset += block_sizes[0]
+            # horizon days
+            seg = one_hot[offset : offset + block_sizes[1]]
+            horizons[line_idx] = float(int(np.argmax(seg)))
+            offset += block_sizes[1]
+
+        return products, horizons
 
     def _build_observations(self):
         """
@@ -565,11 +934,18 @@ class BoschEnv(object):
         # Shared pieces
         inv = self.inventory.astype(np.float32)
         back = self.backlog.astype(np.float32)
-        remaining_demand = (
-            np.sum(self.demand[self.period_index :], axis=0)
-            if self.period_index < self.num_periods
-            else np.zeros_like(inv)
+        queue_segment_len = self.num_lines * self.num_products
+        coverage = (self.queue > 0).astype(np.float32).sum(axis=0)
+        queue_total = np.sum(self.queue, axis=0).astype(np.float32)
+        if self.num_lines > 0:
+            coverage /= float(self.num_lines)
+        demand_window = np.zeros(
+            (self.lookahead_days, self.num_products), dtype=np.float32
         )
+        for d in range(self.lookahead_days):
+            target_idx = self.period_index + d
+            if target_idx < self.num_periods:
+                demand_window[d] = self.demand[target_idx]
 
         # Line availability = always 1 in this simplified model
         line_availability = np.ones(self.num_lines, dtype=np.float32)
@@ -599,9 +975,44 @@ class BoschEnv(object):
             vec[pos : pos + self.num_products] = back
             pos += self.num_products
 
-            # Remaining demand
-            vec[pos : pos + self.num_products] = remaining_demand
+            # Queue (manager: per-line queues flattened; machines: own line queue)
+            if agent_id == 0:
+                queue_vec = self.queue.reshape(-1).astype(np.float32)
+            else:
+                queue_vec = np.zeros(queue_segment_len, dtype=np.float32)
+                line_idx = agent_id - 1
+                if 0 <= line_idx < self.num_lines:
+                    start = line_idx * self.num_products
+                    end = start + self.num_products
+                    queue_vec[start:end] = self.queue[line_idx].astype(np.float32)
+            vec[pos : pos + queue_segment_len] = queue_vec
+            pos += queue_segment_len
+
+            # Coverage (manager only; machines get zeros)
+            if agent_id == 0:
+                vec[pos : pos + self.num_products] = coverage
             pos += self.num_products
+
+            # Queue total per product (manager only; machines get zeros)
+            if agent_id == 0:
+                vec[pos : pos + self.num_products] = queue_total
+            pos += self.num_products
+
+            # Shortfall per product (manager only; machines get zeros)
+            if agent_id == 0:
+                if demand_window.shape[0] > 0:
+                    demand_next = demand_window[0]
+                else:
+                    demand_next = np.zeros(self.num_products, dtype=np.float32)
+                shortfall = demand_next + back - inv - queue_total
+                shortfall = np.maximum(shortfall, 0.0)
+                vec[pos : pos + self.num_products] = shortfall.astype(np.float32)
+            pos += self.num_products
+
+            # Demand window
+            window_flat = demand_window.reshape(-1)
+            vec[pos : pos + window_flat.size] = window_flat
+            pos += window_flat.size
 
             # Remaining periods
             vec[pos] = float(remaining_periods)
@@ -636,3 +1047,5 @@ class BoschEnv(object):
     def render(self, mode="human"):
         return None
 
+    def close(self):
+        return None
