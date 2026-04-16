@@ -300,6 +300,22 @@ class MPERunner(Runner):
                                     f"unmet_demand_prod_{safe_code}", []
                                 ).append(float(unmet[i]))
 
+                            # Also write a text report instead of printing to terminal.
+                            report_lines = [f"period {period_idx}"]
+                            for i, code in enumerate(codes):
+                                report_lines.append(
+                                    f"{code}: cap={cap[i]:.0f}, assigned={assigned[i]:.0f}, backlog={unmet[i]:.0f}"
+                                )
+                            base_dir = getattr(self, "log_dir", None) or getattr(
+                                self, "save_dir", None
+                            )
+                            if base_dir is not None:
+                                report_path = os.path.join(
+                                    base_dir, "debug_daily_report.txt"
+                                )
+                                with open(report_path, "a", encoding="utf-8") as f:
+                                    f.write("\n".join(report_lines) + "\n")
+
                 data = obs, rewards, dones, infos, available_actions, active_masks, values, actions, action_log_probs, rnn_states, rnn_states_critic 
                 
                 # insert data into buffer

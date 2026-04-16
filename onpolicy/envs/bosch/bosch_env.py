@@ -554,6 +554,18 @@ class BoschEnv(object):
             demand_by_line[line_idx] = demand_sum
             total_demand_by_product[prod_idx] += demand_sum
 
+        net_req_by_product = np.zeros(self.num_products, dtype=np.float32)
+        for prod_idx in range(self.num_products):
+            if not lines_by_product[prod_idx]:
+                continue
+            total_need = (
+                total_demand_by_product[prod_idx]
+                + float(self.backlog[prod_idx])
+                - float(self.inventory[prod_idx])
+                - float(np.sum(self.queue[:, prod_idx]))
+            )
+            net_req_by_product[prod_idx] = max(0.0, total_need)
+
         for line_idx in range(self.num_lines):
             prod_idx = int(products[line_idx])
             horizon = int(horizons[line_idx])
@@ -581,18 +593,11 @@ class BoschEnv(object):
             else:
                 share_ratio = 1.0 / float(len(assigned_lines))
 
-            backlog_share = float(self.backlog[prod_idx]) * share_ratio
-            inventory_share = float(self.inventory[prod_idx]) * share_ratio
-
-            target_total_needed = demand_sum * share_ratio + backlog_share
+            net_new_qty = net_req_by_product[prod_idx] * share_ratio
 
             # Already in progress for this line/product
             already_in_progress = float(self.queue[line_idx, prod_idx])
-
-            # Net new units to add
-            net_new_qty = max(
-                0.0, target_total_needed - inventory_share - already_in_progress
-            )
+            net_new_qty = max(0.0, net_new_qty - already_in_progress)
 
             # Cap by line capacity over the selected horizon (net of setup time).
             setup_time_for_line = 0.0

@@ -7,8 +7,9 @@
   "max_actions_per_period": 8,
   "lookahead_days": 5,
   "backlog_cost": 15.0,
-  "holding_cost": 2.0,
+  "holding_cost": 5.0,
   "dense_production_reward": 100.0,
+  "per_product_backlog_penalty": 1500.0,
   "capacity_per_line": [
     23.83,
     23.83,
@@ -1291,7 +1292,7 @@
     0.001783,
     0.001494,
     0.001203,
-    0.002336,
+    0.001693,
     0.001775
   ],
   "pm_cost": [
