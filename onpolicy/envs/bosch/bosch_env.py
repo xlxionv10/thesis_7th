@@ -59,6 +59,21 @@ class BoschEnv(object):
         )
         self.alpha_cost_weight = float(getattr(args, "alpha_cost_weight", 0.1))
 
+        # Optional: share end-of-period service costs with machine agents
+        # (helps align dense machine shaping with global objective).
+        self.machine_service_cost_share_beta = float(
+            getattr(args, "machine_service_cost_share_beta", 0.0)
+        )
+        self.machine_service_cost_share_mode = str(
+            getattr(args, "machine_service_cost_share_mode", "assignment")
+        ).strip().lower()
+        self.machine_service_cost_share_include_inventory = bool(
+            getattr(args, "machine_service_cost_share_include_inventory", False)
+        )
+        self.machine_service_cost_share_include_backlog = bool(
+            getattr(args, "machine_service_cost_share_include_backlog", True)
+        )
+
         # Optional metadata for reporting
         self.product_codes = getattr(args, "product_codes", None)
         self.line_codes = getattr(args, "line_codes", None)
@@ -418,6 +433,9 @@ class BoschEnv(object):
                     info["period_cm_cost"] = float(self.last_cm_cost)
                     info["period_utilization"] = float(self.last_utilization_total)
                     info["period_utilization_per_line"] = self.last_utilization_per_line.copy()
+            else:
+                # Machine agents are inactive on manager micro-steps.
+                info["machine_active"] = 0.0 if is_manager_step else 1.0
             infos.append(info)
 
         return obs, rewards, dones, infos
@@ -558,11 +576,38 @@ class BoschEnv(object):
         for prod_idx in range(self.num_products):
             if not lines_by_product[prod_idx]:
                 continue
+            # Credit only queue that is realistically executable under the
+            # currently selected horizons and per-line setup/capacity limits.
+            effective_in_progress = 0.0
+            for line_idx in lines_by_product[prod_idx]:
+                horizon = int(horizons[line_idx])
+                if horizon <= 0:
+                    continue
+
+                proc_time = float(self.processing_time_matrix[line_idx, prod_idx])
+                if proc_time <= 0.0:
+                    continue
+
+                setup_time_for_line = 0.0
+                last_prod = int(self.line_setup[line_idx])
+                if last_prod < 0:
+                    setup_time_for_line = float(self.first_setup_time[line_idx])
+                elif last_prod != prod_idx:
+                    setup_time_for_line = float(
+                        self.setup_time_matrix[line_idx, last_prod, prod_idx]
+                    )
+
+                cap_hours = float(self.capacity_per_line[line_idx]) * float(horizon)
+                cap_hours = max(0.0, cap_hours - setup_time_for_line)
+                cap_units = cap_hours / proc_time if proc_time > 0.0 else 0.0
+                queued_units = float(self.queue[line_idx, prod_idx])
+                effective_in_progress += min(queued_units, cap_units)
+
             total_need = (
                 total_demand_by_product[prod_idx]
                 + float(self.backlog[prod_idx])
                 - float(self.inventory[prod_idx])
-                - float(np.sum(self.queue[:, prod_idx]))
+                - float(effective_in_progress)
             )
             net_req_by_product[prod_idx] = max(0.0, total_need)
 
@@ -593,11 +638,9 @@ class BoschEnv(object):
             else:
                 share_ratio = 1.0 / float(len(assigned_lines))
 
+            # net_req_by_product already subtracts total in-progress queue for this
+            # product across all lines, so do not subtract per-line queue again.
             net_new_qty = net_req_by_product[prod_idx] * share_ratio
-
-            # Already in progress for this line/product
-            already_in_progress = float(self.queue[line_idx, prod_idx])
-            net_new_qty = max(0.0, net_new_qty - already_in_progress)
 
             # Cap by line capacity over the selected horizon (net of setup time).
             setup_time_for_line = 0.0
@@ -614,7 +657,12 @@ class BoschEnv(object):
             cap_hours = max(0.0, cap_hours - setup_time_for_line)
             cap_units = cap_hours / proc_time if proc_time > 0.0 else 0.0
 
-            qty_to_add = min(net_new_qty, cap_units)
+            # NEW: Check how full the bucket already is!
+            current_queue = float(self.queue[line_idx, prod_idx])
+            available_cap = max(0.0, cap_units - current_queue)
+
+            # Cap the addition by the ACTUAL remaining space on this line
+            qty_to_add = min(net_new_qty, available_cap)
 
             if qty_to_add <= 0.0:
                 continue
@@ -843,18 +891,10 @@ class BoschEnv(object):
 
     def _period_effectively_over(self):
         """
-        Simple heuristic to end a period early:
-        - All lines have ended their shift, OR
-        - There is no remaining capacity on any line, OR
-        - There is no work left in any queue.
+        The period is effectively over if every line has either explicitly
+        ended its shift, or has run out of capacity.
         """
-        if np.all(self.line_done):
-            return True
-        if np.all(self.remaining_capacity <= 0.0):
-            return True
-        if np.all(self.queue <= 0.0):
-            return True
-        return False
+        return bool(np.all(self.line_done | (self.remaining_capacity <= 0.0)))
 
     def _end_period(self):
         """
@@ -864,7 +904,7 @@ class BoschEnv(object):
         self.last_period_index = self.period_index
 
         # Inventory / backlog cost update based on total production this period.
-        inv_cost, backlog_cost = self._update_inventory_and_backlog(
+        inv_cost, backlog_cost, inv_costs, backlog_costs = self._update_inventory_and_backlog(
             self.period_produced_per_product
         )
         self.last_inv_cost = float(inv_cost)
@@ -965,8 +1005,53 @@ class BoschEnv(object):
 
         # --- 3. MACHINE REWARD ---
         # Machine agents receive dense, local rewards during _machines_step().
-        # We avoid adding any end-of-period service penalties here.
         rewards[1:, 0] = 0.0
+
+        # Optional: share end-of-period service costs (inventory/backlog) with machines.
+        # This is a "soft team reward" that preserves dense shaping while aligning incentives.
+        beta = float(self.machine_service_cost_share_beta)
+        if beta > 0.0 and self.num_lines > 0:
+            include_inv = bool(self.machine_service_cost_share_include_inventory)
+            include_backlog = bool(self.machine_service_cost_share_include_backlog)
+            if include_inv or include_backlog:
+                service_costs = np.zeros(self.num_products, dtype=np.float32)
+                if include_inv:
+                    service_costs += inv_costs.astype(np.float32)
+                if include_backlog:
+                    service_costs += backlog_costs.astype(np.float32)
+
+                mode = str(self.machine_service_cost_share_mode).lower()
+                weights = np.zeros((self.num_lines, self.num_products), dtype=np.float32)
+
+                if mode == "production":
+                    weights = self.period_produced_per_line.astype(np.float32).copy()
+                elif mode == "queue":
+                    # Use end-of-period remaining queue as responsibility proxy.
+                    weights = np.maximum(self.queue.astype(np.float32), 0.0)
+                else:
+                    # Default: assignment-based (manager choice this period).
+                    for l in range(self.num_lines):
+                        p = int(self.last_manager_products[l])
+                        if 0 <= p < self.num_products and float(self.last_manager_horizons[l]) > 0.0:
+                            weights[l, p] = float(self.last_manager_horizons[l])
+
+                denom = np.sum(weights, axis=0)  # per product
+                for p in range(self.num_products):
+                    cost_p = float(service_costs[p])
+                    if cost_p <= 0.0:
+                        continue
+                    d = float(denom[p])
+                    if d <= 1e-8:
+                        # Fall back to uniform split across all lines.
+                        share = cost_p / float(self.num_lines)
+                        for l in range(self.num_lines):
+                            rewards[1 + l, 0] -= beta * share
+                        continue
+                    for l in range(self.num_lines):
+                        w = float(weights[l, p])
+                        if w <= 0.0:
+                            continue
+                        rewards[1 + l, 0] -= beta * (w / d) * cost_p
 
         return rewards
 
@@ -1001,7 +1086,7 @@ class BoschEnv(object):
         self.last_product_service_costs = inv_costs + backlog_costs
         inv_cost = float(np.sum(inv_costs))
         backlog_cost = float(np.sum(backlog_costs))
-        return inv_cost, backlog_cost
+        return inv_cost, backlog_cost, inv_costs, backlog_costs
 
     def _decode_agent0_action(self, action_vec):
         """

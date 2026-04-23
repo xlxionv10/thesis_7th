@@ -66,9 +66,18 @@ class MPERunner(Runner):
             env_info = infos[env_idx]
             if len(env_info) == 0:
                 continue
-            manager_info = env_info[0]
-            if "manager_active" in manager_info:
-                active_masks[env_idx, 0, 0] = float(manager_info["manager_active"])
+            for agent_id in range(min(len(env_info), self.num_agents)):
+                agent_info = env_info[agent_id]
+                if agent_id == 0:
+                    if "manager_active" in agent_info:
+                        active_masks[env_idx, 0, 0] = float(
+                            agent_info["manager_active"]
+                        )
+                else:
+                    if "machine_active" in agent_info:
+                        active_masks[env_idx, agent_id, 0] = float(
+                            agent_info["machine_active"]
+                        )
         return active_masks
        
     def run(self):
