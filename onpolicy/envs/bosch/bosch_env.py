@@ -228,12 +228,16 @@ class BoschEnv(object):
         ]
 
         # Action spaces
-        # Agent 0: MultiDiscrete per line: (product_index, horizon_days)
-        # product_index in [0, num_products-1], horizon_days in [0, manager_max_horizon]
+        # Agent 0: MultiDiscrete per line:
+        #   (primary_product, horizon_days, secondary_product)
+        # primary_product  in [0, num_products-1]
+        # horizon_days     in [0, manager_max_horizon]
+        # secondary_product in [0, num_products]  (num_products = "none")
         lot_dims = []
         for _ in range(self.num_lines):
-            lot_dims.append([0, self.num_products - 1])
-            lot_dims.append([0, self.manager_max_horizon])
+            lot_dims.append([0, self.num_products - 1])   # primary product
+            lot_dims.append([0, self.manager_max_horizon]) # horizon
+            lot_dims.append([0, self.num_products])        # secondary product (P = none)
         agent0_act = MultiDiscrete(lot_dims)
 
         # Machine agents: Discrete
@@ -544,12 +548,23 @@ class BoschEnv(object):
     def _manager_step(self, actions_env):
         """
         Agent 0 chooses lot allocations once per period.
+
+        The manager selects a primary (product, horizon) and an optional
+        secondary product per line.  Primary allocation fills the queue
+        based on demand and net requirements.  The secondary pass fills
+        remaining line capacity with the secondary product, enabling
+        cross-scheduling (e.g. Line 2 produces P097 then P100).
         """
-        # Decode agent 0 action (product + horizon per line)
-        products, horizons = self._decode_agent0_action(actions_env[0])
+        # Decode agent 0 action (primary product, horizon, secondary product)
+        products, horizons, secondary_products = self._decode_agent0_action(
+            actions_env[0]
+        )
         self.last_manager_horizons = horizons.astype(np.float32).copy()
         self.last_manager_products = products.astype(np.int32).copy()
 
+        # ------------------------------------------------------------------
+        # PRIMARY ALLOCATION (unchanged logic)
+        # ------------------------------------------------------------------
         # Add allocated lots into each line's queue based on demand horizon.
         # Backlog is shared across lines choosing the same product and
         # is split proportionally by each line's horizon demand.
@@ -611,6 +626,10 @@ class BoschEnv(object):
             )
             net_req_by_product[prod_idx] = max(0.0, total_need)
 
+        # Track how many capacity-hours each line consumes in the primary pass
+        # so the secondary pass knows how much room is left.
+        primary_hours_used = np.zeros(self.num_lines, dtype=np.float32)
+
         for line_idx in range(self.num_lines):
             prod_idx = int(products[line_idx])
             horizon = int(horizons[line_idx])
@@ -657,7 +676,7 @@ class BoschEnv(object):
             cap_hours = max(0.0, cap_hours - setup_time_for_line)
             cap_units = cap_hours / proc_time if proc_time > 0.0 else 0.0
 
-            # NEW: Check how full the bucket already is!
+            # Check how full the bucket already is!
             current_queue = float(self.queue[line_idx, prod_idx])
             available_cap = max(0.0, cap_units - current_queue)
 
@@ -668,6 +687,83 @@ class BoschEnv(object):
                 continue
 
             self.queue[line_idx, prod_idx] += qty_to_add
+            primary_hours_used[line_idx] += (
+                qty_to_add * proc_time + setup_time_for_line
+            )
+
+        # ------------------------------------------------------------------
+        # SECONDARY ALLOCATION
+        # ------------------------------------------------------------------
+        for line_idx in range(self.num_lines):
+            sec_prod = int(secondary_products[line_idx])
+            # Index == num_products means "none" — skip.
+            if sec_prod >= self.num_products:
+                continue
+            if self.line_eligibility[line_idx, sec_prod] < 0.5:
+                continue
+
+            sec_proc_time = float(
+                self.processing_time_matrix[line_idx, sec_prod]
+            )
+            if sec_proc_time <= 0.0:
+                continue
+
+            primary_prod = int(products[line_idx])
+            horizon = int(horizons[line_idx])
+            
+            # Treat horizon=0 as a 1-day lookahead for the secondary product 
+            # so the secondary product can still function if primary was skipped.
+            effective_horizon = max(1, horizon)
+
+            if horizon > 0 and self.line_eligibility[line_idx, primary_prod] >= 0.5:
+                effective_last_prod = primary_prod
+            else:
+                effective_last_prod = int(self.line_setup[line_idx])
+
+            sec_setup_time = 0.0
+            if effective_last_prod < 0:
+                sec_setup_time = float(self.first_setup_time[line_idx])
+            elif effective_last_prod != sec_prod:
+                sec_setup_time = float(
+                    self.setup_time_matrix[
+                        line_idx, effective_last_prod, sec_prod
+                    ]
+                )
+
+            # FIX 2: Multiply total capacity by the effective horizon!
+            total_cap_hours = float(self.capacity_per_line[line_idx]) * float(effective_horizon)
+            
+            remaining_hours = max(
+                0.0,
+                total_cap_hours
+                - float(primary_hours_used[line_idx])
+                - sec_setup_time,
+            )
+            if remaining_hours <= 0.0:
+                continue
+
+            remaining_units = remaining_hours / sec_proc_time
+
+            # FIX 1: Bound the demand sum by the effective horizon!
+            start = self.period_index
+            end = min(self.period_index + effective_horizon, self.num_periods)
+            sec_demand_sum = float(np.sum(self.demand[start:end, sec_prod]))
+
+            sec_need = (
+                sec_demand_sum
+                + float(self.backlog[sec_prod])
+                - float(self.inventory[sec_prod])
+                - float(np.sum(self.queue[:, sec_prod]))
+            )
+            sec_need = max(0.0, sec_need)
+            if sec_need <= 0.0:
+                continue
+
+            qty_to_add = min(remaining_units, sec_need)
+            if qty_to_add <= 0.0:
+                continue
+
+            self.queue[line_idx, sec_prod] += qty_to_add
 
     def _machines_step(self, actions_env, rewards):
         """
@@ -871,16 +967,25 @@ class BoschEnv(object):
 
     def _build_available_actions(self):
         # Agent 0 uses MultiDiscrete; build a per-dimension mask.
-        # Layout per line: [product (P), horizon (H+1)].
+        # Layout per line: [product (P), horizon (H+1), secondary (P+1)].
         if self.num_lines > 0 and self.num_products > 0:
             masks = []
             for line_idx in range(self.num_lines):
+                # Primary product: eligible products
                 prod_mask = self.line_eligibility[line_idx].astype(np.float32).copy()
                 if np.sum(prod_mask) <= 0.0:
                     prod_mask[:] = 1.0
+                # Horizon: all horizons always valid
                 horizon_mask = np.ones(self.manager_max_horizon + 1, dtype=np.float32)
+                # Secondary product: eligible products + "none" (index P)
+                sec_mask = np.zeros(self.num_products + 1, dtype=np.float32)
+                sec_mask[:self.num_products] = (
+                    self.line_eligibility[line_idx].astype(np.float32)
+                )
+                sec_mask[self.num_products] = 1.0  # "none" is always valid
                 masks.append(prod_mask)
                 masks.append(horizon_mask)
+                masks.append(sec_mask)
             manager_mask = np.concatenate(masks, axis=0)
         else:
             manager_mask = np.zeros(0, dtype=np.float32)
@@ -1091,16 +1196,18 @@ class BoschEnv(object):
     def _decode_agent0_action(self, action_vec):
         """
         Convert concatenated one-hot representation back into per-line
-        (product_index, horizon_days) selections.
+        (product_index, horizon_days, secondary_product) selections.
         """
         one_hot = np.asarray(action_vec, dtype=np.float32).ravel()
 
-        num_dims = self.num_lines * 2
-        block_sizes = [self.num_products, self.manager_max_horizon + 1]
+        num_dims = self.num_lines * 3
+        block_sizes = [
+            self.num_products,             # primary product
+            self.manager_max_horizon + 1,  # horizon
+            self.num_products + 1,         # secondary product (P = "none")
+        ]
 
-        expected_len = 0
-        for _ in range(self.num_lines):
-            expected_len += block_sizes[0] + block_sizes[1]
+        expected_len = sum(block_sizes) * self.num_lines
 
         if one_hot.size != expected_len:
             raise ValueError(
@@ -1111,10 +1218,11 @@ class BoschEnv(object):
 
         products = np.zeros(self.num_lines, dtype=np.float32)
         horizons = np.zeros(self.num_lines, dtype=np.float32)
+        secondary_products = np.zeros(self.num_lines, dtype=np.float32)
 
         offset = 0
         for line_idx in range(self.num_lines):
-            # product index
+            # primary product index
             seg = one_hot[offset : offset + block_sizes[0]]
             products[line_idx] = float(int(np.argmax(seg)))
             offset += block_sizes[0]
@@ -1122,8 +1230,12 @@ class BoschEnv(object):
             seg = one_hot[offset : offset + block_sizes[1]]
             horizons[line_idx] = float(int(np.argmax(seg)))
             offset += block_sizes[1]
+            # secondary product index (num_products = "none")
+            seg = one_hot[offset : offset + block_sizes[2]]
+            secondary_products[line_idx] = float(int(np.argmax(seg)))
+            offset += block_sizes[2]
 
-        return products, horizons
+        return products, horizons, secondary_products
 
     def _build_observations(self):
         """
