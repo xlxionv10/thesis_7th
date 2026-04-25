@@ -955,13 +955,19 @@ class BoschEnv(object):
             mask[end_index] = 1.0
             return mask
 
-        # PM and end shift are always valid controls for active lines.
+        # PM is always a valid control
         mask[pm_index] = 1.0
-        mask[end_index] = 1.0
-
+        
+        # Check if there are any products we can actually process
+        can_work = False
         for product_idx in range(self.num_products):
             if self._can_process_product(line_idx, product_idx):
                 mask[product_idx] = 1.0
+                can_work = True
+
+        # NEW: You can only End Shift if there is no work you can do!
+        if not can_work:
+            mask[end_index] = 1.0
 
         return mask
 
