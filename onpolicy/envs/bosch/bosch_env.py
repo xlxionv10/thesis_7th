@@ -744,6 +744,10 @@ class BoschEnv(object):
 
             remaining_units = remaining_hours / sec_proc_time
 
+            # NEW FIX: Prevent Secondary Queue Explosion by checking the existing bucket!
+            current_sec_queue = float(self.queue[line_idx, sec_prod])
+            available_sec_cap = max(0.0, remaining_units - current_sec_queue)
+
             # FIX 1: Bound the demand sum by the effective horizon!
             start = self.period_index
             end = min(self.period_index + effective_horizon, self.num_periods)
@@ -759,7 +763,7 @@ class BoschEnv(object):
             if sec_need <= 0.0:
                 continue
 
-            qty_to_add = min(remaining_units, sec_need)
+            qty_to_add = min(available_sec_cap, sec_need)
             if qty_to_add <= 0.0:
                 continue
 
@@ -1188,11 +1192,7 @@ class BoschEnv(object):
             inv_costs[p] = self.holding_cost * self.inventory[p]
             backlog_costs[p] = self.backlog_cost * self.backlog[p]
             if self.backlog[p] > 0:
-                avg_ref = float(getattr(self, "avg_demand_per_product", period_demand)[p])
-                demand_ref = max(1.0, float(period_demand[p]), avg_ref)
-                backlog_costs[p] += self.per_product_backlog_penalty * (
-                    float(self.backlog[p]) / demand_ref
-                )
+                backlog_costs[p] += self.per_product_backlog_penalty
 
         self.last_product_service_costs = inv_costs + backlog_costs
         inv_cost = float(np.sum(inv_costs))
@@ -1343,7 +1343,8 @@ class BoschEnv(object):
             # Shortfall per product (manager only; machines get zeros)
             if agent_id == 0:
                 if demand_window.shape[0] > 0:
-                    demand_next = demand_window[0]
+                    # NEW FIX: Sum the demand over the entire lookahead window!
+                    demand_next = np.sum(demand_window, axis=0) 
                 else:
                     demand_next = np.zeros(self.num_products, dtype=np.float32)
                 shortfall = demand_next + back - inv - queue_total
