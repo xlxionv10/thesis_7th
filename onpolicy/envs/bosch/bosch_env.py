@@ -563,14 +563,12 @@ class BoschEnv(object):
         self.last_manager_products = products.astype(np.int32).copy()
 
         # ------------------------------------------------------------------
-        # PRIMARY ALLOCATION (unchanged logic)
+        # PRIMARY ALLOCATION (Greedy Waterfall Fix)
         # ------------------------------------------------------------------
-        # Add allocated lots into each line's queue based on demand horizon.
-        # Backlog is shared across lines choosing the same product and
-        # is split proportionally by each line's horizon demand.
         lines_by_product = {p: [] for p in range(self.num_products)}
         demand_by_line = np.zeros(self.num_lines, dtype=np.float32)
         total_demand_by_product = np.zeros(self.num_products, dtype=np.float32)
+        
         for line_idx in range(self.num_lines):
             prod_idx = int(products[line_idx])
             horizon = int(horizons[line_idx])
@@ -578,118 +576,105 @@ class BoschEnv(object):
                 continue
             if self.line_eligibility[line_idx, prod_idx] < 0.5:
                 continue
+                
             start = self.period_index
             end = min(self.period_index + horizon, self.num_periods)
             demand_sum = float(np.sum(self.demand[start:end, prod_idx]))
+            
             if demand_sum <= 0.0 and self.backlog[prod_idx] <= 0.0:
                 continue
+                
             lines_by_product[prod_idx].append(line_idx)
             demand_by_line[line_idx] = demand_sum
             total_demand_by_product[prod_idx] += demand_sum
 
-        net_req_by_product = np.zeros(self.num_products, dtype=np.float32)
+        primary_hours_used = np.zeros(self.num_lines, dtype=np.float32)
+
         for prod_idx in range(self.num_products):
-            if not lines_by_product[prod_idx]:
+            assigned_lines = lines_by_product[prod_idx]
+            if not assigned_lines:
                 continue
-            # Credit only queue that is realistically executable under the
-            # currently selected horizons and per-line setup/capacity limits.
-            effective_in_progress = 0.0
-            for line_idx in lines_by_product[prod_idx]:
+                
+            # 1. Compute True Global Shortfall for this product
+            global_gross_need = (
+                total_demand_by_product[prod_idx]
+                + float(self.backlog[prod_idx])
+                - float(self.inventory[prod_idx])
+            )
+            global_gross_need = max(0.0, global_gross_need)
+            
+            total_existing_queue = float(np.sum(self.queue[:, prod_idx]))
+            unallocated_shortfall = max(0.0, global_gross_need - total_existing_queue)
+            
+            if unallocated_shortfall <= 0.0:
+                continue
+                
+            # 2. Compute available physical capacity for each assigned line
+            line_available_caps = {}
+            line_proc_times = {}
+            line_setup_times = {}
+            
+            for line_idx in assigned_lines:
                 horizon = int(horizons[line_idx])
-                if horizon <= 0:
-                    continue
-
                 proc_time = float(self.processing_time_matrix[line_idx, prod_idx])
-                if proc_time <= 0.0:
-                    continue
-
+                
                 setup_time_for_line = 0.0
                 last_prod = int(self.line_setup[line_idx])
                 if last_prod < 0:
                     setup_time_for_line = float(self.first_setup_time[line_idx])
                 elif last_prod != prod_idx:
-                    setup_time_for_line = float(
-                        self.setup_time_matrix[line_idx, last_prod, prod_idx]
-                    )
-
+                    setup_time_for_line = float(self.setup_time_matrix[line_idx, last_prod, prod_idx])
+                    
                 cap_hours = float(self.capacity_per_line[line_idx]) * float(horizon)
                 cap_hours = max(0.0, cap_hours - setup_time_for_line)
                 cap_units = cap_hours / proc_time if proc_time > 0.0 else 0.0
-                queued_units = float(self.queue[line_idx, prod_idx])
-                effective_in_progress += min(queued_units, cap_units)
-
-            total_need = (
-                total_demand_by_product[prod_idx]
-                + float(self.backlog[prod_idx])
-                - float(self.inventory[prod_idx])
-                - float(effective_in_progress)
-            )
-            net_req_by_product[prod_idx] = max(0.0, total_need)
-
-        # Track how many capacity-hours each line consumes in the primary pass
-        # so the secondary pass knows how much room is left.
-        primary_hours_used = np.zeros(self.num_lines, dtype=np.float32)
-
-        for line_idx in range(self.num_lines):
-            prod_idx = int(products[line_idx])
-            horizon = int(horizons[line_idx])
-
-            if horizon <= 0:
-                continue
-
-            if self.line_eligibility[line_idx, prod_idx] < 0.5:
-                continue
-
-            start = self.period_index
-            end = min(self.period_index + horizon, self.num_periods)
-            demand_sum = float(np.sum(self.demand[start:end, prod_idx]))
-            if demand_sum <= 0.0 and self.backlog[prod_idx] <= 0.0:
-                continue
-
-            assigned_lines = lines_by_product[prod_idx]
-            if not assigned_lines:
-                continue
-
-            if total_demand_by_product[prod_idx] > 0.0:
-                share_ratio = float(
-                    demand_by_line[line_idx] / total_demand_by_product[prod_idx]
-                )
-            else:
-                share_ratio = 1.0 / float(len(assigned_lines))
-
-            # net_req_by_product already subtracts total in-progress queue for this
-            # product across all lines, so do not subtract per-line queue again.
-            net_new_qty = net_req_by_product[prod_idx] * share_ratio
-
-            # Cap by line capacity over the selected horizon (net of setup time).
-            setup_time_for_line = 0.0
-            last_prod = int(self.line_setup[line_idx])
-            if last_prod < 0:
-                setup_time_for_line = float(self.first_setup_time[line_idx])
-            elif last_prod != prod_idx:
-                setup_time_for_line = float(
-                    self.setup_time_matrix[line_idx, last_prod, prod_idx]
-                )
-
-            cap_hours = float(self.capacity_per_line[line_idx]) * float(horizon)
-            proc_time = float(self.processing_time_matrix[line_idx, prod_idx])
-            cap_hours = max(0.0, cap_hours - setup_time_for_line)
-            cap_units = cap_hours / proc_time if proc_time > 0.0 else 0.0
-
-            # Check how full the bucket already is!
-            current_queue = float(self.queue[line_idx, prod_idx])
-            available_cap = max(0.0, cap_units - current_queue)
-
-            # Cap the addition by the ACTUAL remaining space on this line
-            qty_to_add = min(net_new_qty, available_cap)
-
-            if qty_to_add <= 0.0:
-                continue
-
-            self.queue[line_idx, prod_idx] += qty_to_add
-            primary_hours_used[line_idx] += (
-                qty_to_add * proc_time + setup_time_for_line
-            )
+                
+                current_queue = float(self.queue[line_idx, prod_idx])
+                available_cap = max(0.0, cap_units - current_queue)
+                
+                line_available_caps[line_idx] = available_cap
+                line_proc_times[line_idx] = proc_time
+                line_setup_times[line_idx] = setup_time_for_line
+                
+            # 3. Greedy Waterfall Loop
+            active_lines = list(assigned_lines)
+            added_qty = {l: 0.0 for l in assigned_lines}
+            
+            while unallocated_shortfall > 1e-5 and active_lines:
+                total_weight = sum(demand_by_line[l] for l in active_lines)
+                if total_weight <= 0.0:
+                    weights = {l: 1.0 / len(active_lines) for l in active_lines}
+                else:
+                    weights = {l: demand_by_line[l] / total_weight for l in active_lines}
+                    
+                next_active = []
+                for l in active_lines:
+                    share = unallocated_shortfall * weights[l]
+                    space_left = line_available_caps[l] - added_qty[l]
+                    
+                    if share >= space_left:
+                        # Line takes all its remaining space and drops out
+                        take = space_left
+                        unallocated_shortfall -= take
+                        added_qty[l] += take
+                    else:
+                        # Line takes its share and remains active for next round (if any)
+                        take = share
+                        unallocated_shortfall -= take
+                        added_qty[l] += take
+                        next_active.append(l)
+                        
+                if len(next_active) == len(active_lines):
+                    # No lines hit their capacity limit this round, we are done
+                    break
+                active_lines = next_active
+                
+            # 4. Final Addition to Queues
+            for l in assigned_lines:
+                qty = added_qty[l]
+                if qty > 0.0:
+                    self.queue[l, prod_idx] += qty
+                    primary_hours_used[l] += (qty * line_proc_times[l] + line_setup_times[l])
 
         # ------------------------------------------------------------------
         # SECONDARY ALLOCATION
